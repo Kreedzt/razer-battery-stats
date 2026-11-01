@@ -4,7 +4,10 @@ A battery panel for the Windows 10 classic taskbar that shows your Razer mouse's
 charge level. It talks to the mouse over HID directly — **Razer Synapse is not
 required and need not be running**.
 
-![platform](https://img.shields.io/badge/platform-Windows%2010-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+[![build](https://github.com/Kreedzt/razer-battery-stats/actions/workflows/release.yml/badge.svg)](https://github.com/Kreedzt/razer-battery-stats/actions/workflows/release.yml)
+[![release](https://img.shields.io/github/v/release/Kreedzt/razer-battery-stats)](https://github.com/Kreedzt/razer-battery-stats/releases/latest)
+![platform](https://img.shields.io/badge/platform-Windows%2010-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
 
 ![The battery panel in the taskbar, showing 42%](assets/panel.png)
 

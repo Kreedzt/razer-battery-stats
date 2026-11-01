@@ -10,3 +10,4 @@ cp2a-*.log
 
 # Working notes: research, task logs, screenshots. Kept locally, never published.
 /docs
+dist/

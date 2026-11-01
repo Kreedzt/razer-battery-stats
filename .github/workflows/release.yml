@@ -97,27 +97,33 @@ jobs:
       # Ship the executable with the license texts the binary references but
       # does not embed: the project MIT text and the upstream razer-hid notice
       # required by its MIT terms.
+      # Archive with Python's zipfile rather than `tar -a` or
+      # `Compress-Archive`:
+      #   - `tar -a` in the runner's Git Bash silently wrote a 320 KB file whose
+      #     header was "raze", not "PK" — a broken zip shipped as a release.
+      #   - `Compress-Archive` depends on a PowerShell module that is not
+      #     guaranteed to load.
+      # Python is preinstalled on the runner and zipfile is unambiguous.
       - name: Assemble package
         shell: bash
         run: |
-          mkdir -p dist/razer-battery-taskbar
-          cp target/release/razer-battery-taskbar.exe dist/razer-battery-taskbar/
-          cp LICENSE README.md dist/razer-battery-taskbar/
+          mkdir -p dist/package
+          cp target/release/razer-battery-taskbar.exe dist/package/
+          cp LICENSE README.md dist/package/
+          # The binary embeds the MIT attribution but not the license text, and
+          # razer-hid's MIT terms require shipping its notice alongside.
           curl -fsSL \
             "https://raw.githubusercontent.com/xzeldon/razer-battery-report/v1.3.0/LICENSE" \
-            -o dist/razer-battery-taskbar/LICENSE-razer-hid
+            -o dist/package/LICENSE-razer-hid
           version="${GITHUB_REF_NAME#v}"
           if [ "$GITHUB_REF_TYPE" != "tag" ]; then
             version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           fi
-          cd dist
-          # Compress-Archive cannot write here (pwsh-only), so zip via tar on
-          # the runner's bsdtar, which produces standard .zip archives.
-          tar -a -c -f "razer-battery-taskbar-${version}-windows-x64.zip" razer-battery-taskbar
-          sha256sum "razer-battery-taskbar-${version}-windows-x64.zip" > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-          ls -l
+          echo "PKG_VERSION=$version" >> "$GITHUB_ENV"
 
+      - name: Archive package
+        shell: bash
+        run: python scripts/package.py "$PKG_VERSION"
       - uses: actions/upload-artifact@v7
         with:
           name: razer-battery-taskbar-windows-x64

@@ -1,3 +1,12 @@
+# Build output
+/target
+
+# Local diagnostics (tools/ holds throwaway probes, never third-party source)
 tools/*.exe
 tools/*.exe.*
-/target
+tools/dbg*.txt
+cp2a-*.bmp
+cp2a-*.log
+
+# Working notes: research, task logs, screenshots. Kept locally, never published.
+/docs

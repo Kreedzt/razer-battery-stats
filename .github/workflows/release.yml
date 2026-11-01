@@ -1,0 +1,159 @@
+name: build-and-release
+
+# - Any branch push builds, so `main` stays green and breakage shows up early.
+#   Nothing is published for a branch push.
+# - A `v*` tag runs the same build and then publishes a GitHub Release. A tag
+#   fires the same `push` event whether it was created locally
+#   (`git push origin v0.1.0`) or through the web UI, and in both cases
+#   `github.ref` is `refs/tags/...`, which the release job gates on.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Keep the build reproducible across runner images: a newer stable toolchain
+  # must not silently change what ships.
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Build on the MSRV the crate declares, so the release proves the claim
+      # instead of silently requiring whatever stable happens to be current.
+      # The floor is set by the upstream `razer-hid` workspace, which uses
+      # `edition = "2024"` and `resolver = "3"` (both need 1.85). Bump both
+      # together: Cargo.toml's `rust-version` and this pin.
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache per tag so a release never reuses a branch build's
+          # stale artifacts.
+          key: ${{ github.ref }}
+
+      # The tag is the source of truth for the shipped version: stamp it into
+      # Cargo.toml so the binary's VERSIONINFO resource and any archive name
+      # carry the tag rather than whatever was committed. Branch builds keep
+      # the committed version.
+      - name: Stamp version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          # Only the first `version = "…"` line belongs to [package].
+          sed -i '0,/^version = ".*"/s//version = "'"$version"'"/' Cargo.toml
+          grep -m1 '^version' Cargo.toml
+          # Changing [package].version invalidates Cargo.lock's own entry for
+          # this crate, so --locked would abort a step later. Regenerate now.
+          cargo update --workspace --offline 2>/dev/null || cargo update --workspace
+          echo "Stamped version $version"
+
+      # Same four commands as CLAUDE.md's required checks; a tag cannot be
+      # published unless all of them pass.
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        timeout-minutes: 15
+
+      - name: Test
+        run: cargo test
+        timeout-minutes: 15
+
+      - name: Build (release)
+        run: cargo build --release --locked
+        timeout-minutes: 20
+
+      # Prove the artifact is the one that was tested: the VERSIONINFO resource
+      # must be present and readable. Without the Windows SDK `rc.exe` the
+      # build still succeeds but ships no metadata, which would make this step
+      # fail loudly rather than publish an unstamped binary.
+      - name: Verify version resource
+        shell: pwsh
+        run: |
+          $exe = "target/release/razer-battery-taskbar.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $vi = (Get-Item $exe).VersionInfo
+          $stamped = $env:GITHUB_REF_NAME -replace '^v', ''
+          Write-Host "ProductName : $($vi.ProductName)"
+          Write-Host "FileVersion : $($vi.FileVersion)"
+          if (-not $vi.ProductName) { throw "VERSIONINFO missing (rc.exe unavailable?)" }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $vi.FileVersion -notlike "$stamped*") {
+            throw "FileVersion $($vi.FileVersion) does not match tag $stamped"
+          }
+
+      # Ship the executable with the license texts the binary references but
+      # does not embed: the project MIT text and the upstream razer-hid notice
+      # required by its MIT terms.
+      - name: Assemble package
+        shell: bash
+        run: |
+          mkdir -p dist/razer-battery-taskbar
+          cp target/release/razer-battery-taskbar.exe dist/razer-battery-taskbar/
+          cp LICENSE README.md dist/razer-battery-taskbar/
+          curl -fsSL \
+            "https://raw.githubusercontent.com/xzeldon/razer-battery-report/v1.3.0/LICENSE" \
+            -o dist/razer-battery-taskbar/LICENSE-razer-hid
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          fi
+          cd dist
+          # Compress-Archive cannot write here (pwsh-only), so zip via tar on
+          # the runner's bsdtar, which produces standard .zip archives.
+          tar -a -c -f "razer-battery-taskbar-${version}-windows-x64.zip" razer-battery-taskbar
+          sha256sum "razer-battery-taskbar-${version}-windows-x64.zip" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -l
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: razer-battery-taskbar-windows-x64
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    needs: build
+    # Publish on tags only; branch and PR pushes run the build for CI alone.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: razer-battery-taskbar-windows-x64
+          path: dist-release
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist-release
+          # Idempotent: a re-run or rebuilt tag must not fail just because the
+          # release already exists.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — uploading assets only."
+          else
+            # Draft first, publish after upload, so a release never goes public
+            # without its archive and checksums.
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --generate-notes --draft
+          fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist-release/*
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

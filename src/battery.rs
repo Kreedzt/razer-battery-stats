@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use razer_hid::Link;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -43,6 +44,9 @@ pub struct Snapshot {
     pub level: Option<u8>,
     /// `Some(true/false)` when the model reports charging; `None` = unknown/unsupported.
     pub charging: Option<bool>,
+    /// Link the last successful read came through; `None` before any read or
+    /// after the mouse disappears. Kept while stale, like `level`.
+    pub link: Option<Link>,
     pub model: Option<String>,
     /// When the last successful read happened.
     pub last_success: Option<Instant>,
@@ -54,6 +58,7 @@ impl Default for Snapshot {
             availability: Availability::Disconnected,
             level: None,
             charging: None,
+            link: None,
             model: None,
             last_success: None,
         }
@@ -78,6 +83,91 @@ pub fn face_state(snapshot: &Snapshot) -> (String, f32) {
         None => PLACEHOLDER_TEXT.to_owned(),
     };
     (label, fill)
+}
+
+/// Multi-line text for the hover tooltip: model, level, charging, link and
+/// freshness.
+///
+/// Pure so the three availability states and the three charging states are
+/// testable without a window or a device. Wording follows the panel rules: a
+/// missing reading is `--%`, a stale reading says so, and charging is never
+/// inferred from the link (a wired mouse can be full and not charging).
+pub fn details_text(snapshot: &Snapshot, now: Instant) -> String {
+    let age = snapshot
+        .last_success
+        .map(|at| now.saturating_duration_since(at));
+    let mut lines = Vec::new();
+    if let Some(model) = &snapshot.model {
+        lines.push(model.clone());
+    }
+    match snapshot.availability {
+        Availability::Ok => {
+            let level = snapshot
+                .level
+                .map_or_else(|| PLACEHOLDER_TEXT.to_owned(), |l| format!("{l}%"));
+            let charging = match snapshot.charging {
+                Some(true) => "Charging",
+                Some(false) => "Not charging",
+                None => "Charging not reported",
+            };
+            let mut line = format!("{level} · {charging}");
+            if let Some(link) = snapshot.link {
+                line.push_str(" · ");
+                line.push_str(link_name(link));
+            }
+            lines.push(line);
+            if let Some(age) = age {
+                lines.push(format!("Updated {}", age_text(age)));
+            }
+        }
+        Availability::Stale => {
+            // The level and link are the last valid ones; charging is unknown
+            // because a failed read cannot prove the mouse stopped charging.
+            let level = snapshot
+                .level
+                .map_or_else(|| PLACEHOLDER_TEXT.to_owned(), |l| format!("{l}%"));
+            let mut line = format!("{level} · Charging unknown");
+            if let Some(link) = snapshot.link {
+                line.push_str(" · ");
+                line.push_str(link_name(link));
+            }
+            lines.push(line);
+            match age {
+                Some(age) => lines.push(format!("Last read {} (stale)", age_text(age))),
+                None => lines.push("No successful read yet (stale)".to_owned()),
+            }
+        }
+        Availability::Disconnected => {
+            lines.push("No mouse detected".to_owned());
+            if let Some(age) = age {
+                lines.push(format!("Last read {}", age_text(age)));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// User-facing name of a HID link.
+fn link_name(link: Link) -> &'static str {
+    match link {
+        Link::Wired => "Wired",
+        Link::Dongle => "Wireless (receiver)",
+        Link::Bluetooth => "Bluetooth",
+    }
+}
+
+/// Coarse age wording; exact seconds are noise for a 30 s poll.
+fn age_text(age: Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 5 {
+        "just now".to_owned()
+    } else if secs < 60 {
+        format!("{secs} s ago")
+    } else if secs < 3600 {
+        format!("{} min ago", secs / 60)
+    } else {
+        format!("{} h ago", secs / 3600)
+    }
 }
 
 /// Handle to the polling thread and its current snapshot.
@@ -211,28 +301,40 @@ enum Outcome {
         level: u8,
         charging: Option<bool>,
         model: String,
+        link: Link,
     },
     NoDevice,
     Failed,
 }
 
 /// Does the device discovery and battery query. Never touches the snapshot.
+///
+/// Every endpoint of every discovered mouse is tried, most-preferred first
+/// (`Wired`, then `Dongle`, then `Bluetooth` — the library sorts them). The
+/// first answer wins and its link is recorded, so a mouse visible through both
+/// its cable and its receiver reports which path actually worked instead of
+/// whichever device happened to enumerate first.
 fn read(hid: &razer_hid::Hid) -> Outcome {
     let devices = match hid.devices() {
         Ok(devices) => devices,
         Err(_) => return Outcome::NoDevice,
     };
-    let Some(device) = devices.first() else {
+    if devices.is_empty() {
         return Outcome::NoDevice;
-    };
-    match device.battery() {
-        Ok(battery) => Outcome::Reading {
-            level: battery.level.get(),
-            charging: battery.charging,
-            model: device.model().to_owned(),
-        },
-        Err(_) => Outcome::Failed,
     }
+    for device in &devices {
+        for endpoint in device.endpoints() {
+            if let Ok(battery) = endpoint.battery() {
+                return Outcome::Reading {
+                    level: battery.level.get(),
+                    charging: battery.charging,
+                    model: device.model().to_owned(),
+                    link: endpoint.link(),
+                };
+            }
+        }
+    }
+    Outcome::Failed
 }
 
 /// Applies one read attempt to a snapshot without any I/O.
@@ -247,21 +349,30 @@ fn publish(snapshot: &mut Snapshot, outcome: Outcome, now: Instant) {
             level,
             charging,
             model,
+            link,
         } => {
             snapshot.availability = Availability::Ok;
             snapshot.level = Some(level);
             snapshot.charging = charging;
+            snapshot.link = Some(link);
             snapshot.model = Some(model);
             snapshot.last_success = Some(now);
         }
         Outcome::NoDevice => {
             snapshot.availability = Availability::Disconnected;
+            // The mouse is gone: its level, charging claim, link and model all
+            // belong to a device that is no longer there. `last_success` stays
+            // so the tooltip can say when it was last seen.
             snapshot.level = None;
             snapshot.charging = None;
+            snapshot.link = None;
+            snapshot.model = None;
         }
         Outcome::Failed => {
             snapshot.availability = Availability::Stale;
-            snapshot.charging = None; // unknown while failing, never "not charging"
+            // The level and link stay from the last valid read; charging is a
+            // claim and cannot be kept without a fresh answer.
+            snapshot.charging = None;
         }
     }
 }
@@ -301,6 +412,7 @@ mod tests {
             availability: Availability::Ok,
             level: Some(47),
             charging: Some(false),
+            link: Some(Link::Dongle),
             model: Some("Razer DeathAdder V3 Pro".into()),
             last_success: Some(Instant::now()),
         }
@@ -312,6 +424,7 @@ mod tests {
         publish(&mut snapshot, Outcome::Failed, Instant::now());
         assert_eq!(snapshot.level, Some(47)); // last valid reading kept
         assert_eq!(snapshot.charging, None); // unknown, not "not charging"
+        assert_eq!(snapshot.link, Some(Link::Dongle)); // last path kept
         assert_eq!(snapshot.availability, Availability::Stale);
     }
 
@@ -322,6 +435,8 @@ mod tests {
         publish(&mut snapshot, Outcome::NoDevice, Instant::now());
         assert_eq!(snapshot.level, None);
         assert_eq!(snapshot.charging, None);
+        assert_eq!(snapshot.link, None);
+        assert_eq!(snapshot.model, None);
         assert_eq!(snapshot.availability, Availability::Disconnected);
     }
 
@@ -334,12 +449,14 @@ mod tests {
                 level: 0,
                 charging: Some(true),
                 model: "m".into(),
+                link: Link::Wired,
             },
             Instant::now(),
         );
         assert_eq!(snapshot.availability, Availability::Ok);
         assert_eq!(snapshot.level, Some(0)); // 0 % is a legal reading
         assert_eq!(snapshot.charging, Some(true));
+        assert_eq!(snapshot.link, Some(Link::Wired));
     }
 
     #[test]
@@ -347,6 +464,128 @@ mod tests {
         let snapshot = Snapshot::default();
         assert_eq!(snapshot.level, None);
         assert_eq!(snapshot.availability, Availability::Disconnected);
+    }
+
+    #[test]
+    fn details_name_the_link_and_charging_state() {
+        let now = Instant::now();
+        let snapshot = Snapshot {
+            availability: Availability::Ok,
+            level: Some(39),
+            charging: Some(false),
+            link: Some(Link::Dongle),
+            model: Some("Razer DeathAdder V3 Pro".into()),
+            last_success: Some(now),
+        };
+        let text = details_text(&snapshot, now);
+        assert!(text.contains("Razer DeathAdder V3 Pro"));
+        assert!(text.contains("39%"));
+        assert!(text.contains("Not charging"));
+        assert!(text.contains("Wireless (receiver)"));
+        assert!(text.contains("Updated just now"));
+    }
+
+    #[test]
+    fn details_name_each_charging_state() {
+        let now = Instant::now();
+        let mut snapshot = snapshot_with_reading();
+        // Some(true)
+        publish(
+            &mut snapshot,
+            Outcome::Reading {
+                level: 39,
+                charging: Some(true),
+                model: "m".into(),
+                link: Link::Dongle,
+            },
+            now,
+        );
+        let text = details_text(&snapshot, now);
+        assert!(text.contains("· Charging ·"), "{text}");
+        // None: the model cannot report charging.
+        publish(
+            &mut snapshot,
+            Outcome::Reading {
+                level: 39,
+                charging: None,
+                model: "m".into(),
+                link: Link::Dongle,
+            },
+            now,
+        );
+        let text = details_text(&snapshot, now);
+        assert!(text.contains("Charging not reported"), "{text}");
+    }
+
+    #[test]
+    fn details_for_a_gone_mouse_drop_the_model_and_link() {
+        let now = Instant::now();
+        let mut snapshot = snapshot_with_reading();
+        publish(&mut snapshot, Outcome::NoDevice, now);
+        let text = details_text(&snapshot, now);
+        assert!(text.contains("No mouse detected"), "{text}");
+        assert!(!text.contains("Razer DeathAdder V3 Pro"), "{text}");
+        assert!(!text.contains("Wireless (receiver)"), "{text}");
+        assert!(text.contains("Last read"), "{text}");
+    }
+
+    #[test]
+    fn details_mark_stale_and_drop_the_charging_claim() {
+        let now = Instant::now();
+        let mut snapshot = snapshot_with_reading();
+        publish(&mut snapshot, Outcome::Failed, now);
+        let text = details_text(&snapshot, now);
+        assert!(text.contains("47%")); // last level kept
+        assert!(text.contains("Charging unknown")); // never "not charging"
+        assert!(text.contains("Wireless (receiver)"));
+        assert!(text.contains("(stale)"));
+        assert!(!text.contains("Not charging"));
+    }
+
+    #[test]
+    fn details_for_a_missing_mouse() {
+        let text = details_text(&Snapshot::default(), Instant::now());
+        assert!(text.contains("No mouse detected"));
+        assert!(!text.contains("Charging"));
+    }
+
+    #[test]
+    fn wired_link_does_not_imply_charging() {
+        let now = Instant::now();
+        let mut snapshot = Snapshot::default();
+        publish(
+            &mut snapshot,
+            Outcome::Reading {
+                level: 100,
+                charging: Some(false),
+                model: "m".into(),
+                link: Link::Wired,
+            },
+            now,
+        );
+        let text = details_text(&snapshot, now);
+        assert!(text.contains("Wired"));
+        assert!(!text.contains("Wireless (receiver)"));
+        assert!(text.contains("Not charging")); // full on the cable, not charging
+    }
+
+    #[test]
+    fn zero_percent_is_not_the_placeholder() {
+        let now = Instant::now();
+        let mut snapshot = Snapshot::default();
+        publish(
+            &mut snapshot,
+            Outcome::Reading {
+                level: 0,
+                charging: Some(false),
+                model: "m".into(),
+                link: Link::Dongle,
+            },
+            now,
+        );
+        let text = details_text(&snapshot, now);
+        assert!(text.contains("0%"));
+        assert!(!text.contains(PLACEHOLDER_TEXT));
     }
 
     #[test]

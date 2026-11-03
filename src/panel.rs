@@ -5,28 +5,33 @@
 //! CP2a draws a placeholder (`--%`, half-filled glyph); CP3 replaces it with
 //! live readings from the HID worker.
 
-use windows::core::{w, PCWSTR};
+use std::time::Instant;
+
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetMonitorInfoW, GetPixel, GetStockObject, GetTextExtentPoint32W, MonitorFromWindow, Polygon,
-    Rectangle, RedrawWindow, ReleaseDC, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    CLR_INVALID, DEFAULT_CHARSET, DT_LEFT, DT_SINGLELINE, DT_VCENTER, FONT_CLIP_PRECISION,
-    FONT_OUTPUT_PRECISION, FW_SEMIBOLD, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH,
-    PAINTSTRUCT, PS_SOLID, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY,
-    TRANSPARENT,
+    GetMonitorInfoW, GetPixel, GetStockObject, GetSysColor, GetSysColorBrush,
+    GetTextExtentPoint32W, InvalidateRect, MonitorFromWindow, Polygon, Rectangle, RedrawWindow,
+    ReleaseDC, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLR_INVALID, COLOR_INFOBK,
+    COLOR_INFOTEXT, DEFAULT_CHARSET, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FW_NORMAL, FW_SEMIBOLD, HDC, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, RDW_ALLCHILDREN, RDW_ERASE,
+    RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     FindWindowW, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsWindow,
     IsWindowVisible, KillTimer, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SetLayeredWindowAttributes, SetParent, SetTimer, SetWindowLongPtrW, ShowWindow, TrackPopupMenu,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, LAYERED_WINDOW_ATTRIBUTES_FLAGS,
-    MF_CHECKED, MF_SEPARATOR, MF_STRING, SW_HIDE, SW_SHOWNOACTIVATE, TPM_NONOTIFY, TPM_RETURNCMD,
+    SetLayeredWindowAttributes, SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TrackPopupMenu, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, MF_CHECKED, MF_SEPARATOR,
+    MF_STRING, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_NCCREATE, WM_TIMER,
-    WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::taskbar::Taskbar;
@@ -36,9 +41,15 @@ use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 const HOST_CLASS_NAME: PCWSTR = w!("RazerBatteryHost");
 /// The visible panel class (a child of Explorer's rebar).
 const PANEL_CLASS_NAME: PCWSTR = w!("RazerBatteryPanel");
+/// The hover tooltip class (a top-level, never-activated popup).
+const TIP_CLASS_NAME: PCWSTR = w!("RazerBatteryTooltip");
 /// Layout/repaint cadence (also the HID-independent refresh of the face).
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 2000;
+/// Polls the cursor while the tooltip is up; there is no `WM_MOUSELEAVE`
+/// without `TrackMouseEvent`, and this is cheaper than adding that feature.
+const TIP_TIMER_ID: usize = 2;
+const TIP_TIMER_MS: u32 = 150;
 
 /// Program state, owned by the *host* window via `GWLP_USERDATA`.
 ///
@@ -55,6 +66,13 @@ pub struct PanelState {
     /// The current panel window, or null between an Explorer restart and the
     /// rebuild. Never a stale handle: it is cleared on `WM_DESTROY`.
     panel: HWND,
+    /// The hover tooltip, created on first hover and kept across panel
+    /// rebuilds (it is a top-level window, not a child of the rebar).
+    tip: HWND,
+    /// Text currently painted in the tooltip and the snapshot it was built
+    /// from, so a repaint never re-measures different text.
+    tip_text: String,
+    tip_snapshot: Option<crate::battery::Snapshot>,
 }
 
 /// Label sampled at startup to size the window: a typical two-digit reading.
@@ -126,6 +144,18 @@ pub fn create(tb: &Taskbar, panel_w: i32) -> Result<HWND, String> {
         if RegisterClassW(&panel_class) == 0 {
             return Err("RegisterClassW(panel) failed".into());
         }
+        // A normal tooltip surface: the system info colours stay readable in
+        // both light and dark themes, and the class brush erases the popup.
+        let tip_class = WNDCLASSW {
+            lpfnWndProc: Some(tip_wndproc),
+            hInstance: hinstance.into(),
+            lpszClassName: TIP_CLASS_NAME,
+            hbrBackground: GetSysColorBrush(COLOR_INFOBK),
+            ..Default::default()
+        };
+        if RegisterClassW(&tip_class) == 0 {
+            return Err("RegisterClassW(tooltip) failed".into());
+        }
         let state = Box::new(PanelState {
             tb: Taskbar {
                 tray: tb.tray,
@@ -136,6 +166,9 @@ pub fn create(tb: &Taskbar, panel_w: i32) -> Result<HWND, String> {
             text_color: theme_text_color(),
             monitor: None,
             panel: HWND::default(),
+            tip: HWND::default(),
+            tip_text: String::new(),
+            tip_snapshot: None,
         });
         // The host is a hidden top-level window owned by this process only. It
         // must NOT be a child of the taskbar: it has to survive Explorer exiting.
@@ -218,6 +251,263 @@ unsafe fn build_panel(host: HWND, st: &mut PanelState) -> Result<HWND, String> {
     Ok(panel)
 }
 
+/// Creates the hidden tooltip popup on first hover.
+unsafe fn create_tip(host: HWND) -> Result<HWND, String> {
+    let hinstance = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {e}"))?;
+    CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        TIP_CLASS_NAME,
+        w!(""),
+        WS_POPUP,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        Some(hinstance.into()),
+        Some(host.0 as *mut _), // GWLP_USERDATA = the host, not a state box
+    )
+    .map_err(|e| format!("CreateWindowExW(tooltip) failed: {e}"))
+}
+
+/// Shows the tooltip on hover, or keeps it up while the cursor moves inside.
+unsafe fn hover_tip(panel: HWND) {
+    let host = host_of(panel);
+    if host.is_invalid() {
+        return;
+    }
+    let st = &mut *state_ptr(host);
+    if st.tip.is_invalid() {
+        match create_tip(host) {
+            Ok(tip) => st.tip = tip,
+            Err(_) => return,
+        }
+    }
+    if !IsWindowVisible(st.tip).as_bool() {
+        update_tip(panel, st);
+    }
+    SetTimer(Some(panel), TIP_TIMER_ID, TIP_TIMER_MS, None);
+}
+
+/// Rebuilds the text only when the snapshot changed; the age line moves with
+/// the 30 s poll, not with every mouse pixel.
+unsafe fn refresh_tip(panel: HWND) {
+    let host = host_of(panel);
+    if host.is_invalid() {
+        return;
+    }
+    let st = &mut *state_ptr(host);
+    if st.tip.is_invalid() {
+        return;
+    }
+    let snapshot = st
+        .monitor
+        .as_ref()
+        .map(crate::battery::BatteryMonitor::snapshot)
+        .unwrap_or_default();
+    // Re-show on every tick when the window is not visible: a repaint or a
+    // transient hide must not leave the hover with no tooltip until the next
+    // poll 30 s later.
+    if !IsWindowVisible(st.tip).as_bool() || st.tip_snapshot.as_ref() != Some(&snapshot) {
+        update_tip(panel, st);
+    }
+}
+
+/// Sizes, positions and paints the tooltip from the current snapshot.
+unsafe fn update_tip(panel: HWND, st: &mut PanelState) {
+    if st.tip.is_invalid() {
+        return;
+    }
+    let snapshot = st
+        .monitor
+        .as_ref()
+        .map(crate::battery::BatteryMonitor::snapshot)
+        .unwrap_or_default();
+    let text = crate::battery::details_text(&snapshot, Instant::now());
+    let dpi = tip_dpi(panel);
+    let (pad_x, pad_y) = tip_padding(dpi);
+
+    // Measure with the same font the paint uses; `DT_CALCRECT` with no
+    // `DT_WORDBREAK` reports the widest line and the total line height.
+    let hdc = GetDC(Some(st.tip));
+    if hdc.is_invalid() {
+        return;
+    }
+    let font = tip_font(dpi);
+    let old = if font.is_invalid() {
+        None
+    } else {
+        Some(SelectObject(hdc, font.into()))
+    };
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: 1000,
+        bottom: 0,
+    };
+    let _ = DrawTextW(hdc, &mut wide, &mut rc, DT_CALCRECT | DT_LEFT | DT_NOPREFIX);
+    if let Some(old) = old {
+        SelectObject(hdc, old);
+        let _ = DeleteObject(font.into());
+    }
+    let _ = ReleaseDC(Some(st.tip), hdc);
+
+    let w = (rc.right - rc.left).max(1) + 2 * pad_x;
+    let h = (rc.bottom - rc.top).max(1) + 2 * pad_y;
+
+    let mut panel_rc = RECT::default();
+    if GetWindowRect(panel, &mut panel_rc).is_err() {
+        return;
+    }
+    let monitor = MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+        return;
+    }
+    let bounds = mi.rcMonitor;
+    let gap = (dpi * 4 / 96).max(2);
+    // Below the panel is outside the bar for a top taskbar; above it is the
+    // only option for a bottom one. The cursor is inside the bar, so it cannot
+    // be used as the anchor.
+    let below = panel_rc.bottom + gap;
+    let above = panel_rc.top - gap - h;
+    let y = if below + h <= bounds.bottom {
+        below
+    } else {
+        above.max(bounds.top)
+    };
+    let x = panel_rc
+        .left
+        .clamp(bounds.left, (bounds.right - w).max(bounds.left));
+
+    let _ = SetWindowPos(st.tip, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
+    let _ = ShowWindow(st.tip, SW_SHOWNOACTIVATE);
+    let _ = InvalidateRect(Some(st.tip), None, true);
+    // The window title carries the same text: a custom-painted tooltip has no
+    // accessible text otherwise, and diagnostic scripts can read it verbatim.
+    let _ = SetWindowTextW(st.tip, &HSTRING::from(text.as_str()));
+    st.tip_text = text;
+    st.tip_snapshot = Some(snapshot);
+}
+
+/// Hides the tooltip and stops the cursor poll. Safe on a dead panel.
+unsafe fn hide_tip(panel: HWND) {
+    let host = host_of(panel);
+    if host.is_invalid() {
+        return;
+    }
+    let st = &mut *state_ptr(host);
+    if !st.tip.is_invalid() {
+        let _ = ShowWindow(st.tip, SW_HIDE);
+    }
+    st.tip_snapshot = None;
+    let _ = KillTimer(Some(panel), TIP_TIMER_ID);
+}
+
+/// Whether the cursor is still inside the panel's screen rect.
+unsafe fn cursor_inside(panel: HWND) -> bool {
+    let mut pt = POINT::default();
+    let mut rc = RECT::default();
+    if GetCursorPos(&mut pt).is_err() || GetWindowRect(panel, &mut rc).is_err() {
+        return false;
+    }
+    pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
+}
+
+/// DPI of `window`, clamped away from the documented 0 on failure.
+unsafe fn tip_dpi(window: HWND) -> i32 {
+    let dpi = GetDpiForWindow(window);
+    if dpi == 0 {
+        96
+    } else {
+        dpi as i32
+    }
+}
+
+/// Padding around the tooltip text, scaled with the monitor DPI.
+fn tip_padding(dpi: i32) -> (i32, i32) {
+    ((dpi * 12 / 96).max(8), (dpi * 8 / 96).max(6))
+}
+
+/// Tooltip font: 9 pt Segoe UI, the Windows UI face.
+unsafe fn tip_font(dpi: i32) -> windows::Win32::Graphics::Gdi::HFONT {
+    CreateFontW(
+        -(dpi * 9 / 72),
+        0,
+        0,
+        0,
+        FW_NORMAL.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET,
+        FONT_OUTPUT_PRECISION(0),
+        FONT_CLIP_PRECISION(0),
+        CLEARTYPE_QUALITY,
+        0,
+        w!("Segoe UI"),
+    )
+}
+
+/// Window procedure of the tooltip: paint only.
+unsafe extern "system" fn tip_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_NCCREATE => {
+            let cs = &*(lparam.0 as *const CREATESTRUCTW);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // WM_PAINT = 0x000F; BeginPaint/EndPaint are paired for the same
+        // reason as the panel: an unvalidated update region floods the queue.
+        0x000F => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let host = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut _);
+            if !host.is_invalid() {
+                let st = &*state_ptr(host);
+                let dpi = tip_dpi(hwnd);
+                let (pad_x, pad_y) = tip_padding(dpi);
+                let mut client = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client);
+                let font = tip_font(dpi);
+                let old = if font.is_invalid() {
+                    None
+                } else {
+                    Some(SelectObject(hdc, font.into()))
+                };
+                let _ = SetBkMode(hdc, TRANSPARENT);
+                let prev = SetTextColor(hdc, COLORREF(GetSysColor(COLOR_INFOTEXT)));
+                let mut text: Vec<u16> = st.tip_text.encode_utf16().collect();
+                let mut rc = RECT {
+                    left: pad_x,
+                    top: pad_y,
+                    right: client.right - pad_x,
+                    bottom: client.bottom - pad_y,
+                };
+                let _ = DrawTextW(hdc, &mut text, &mut rc, DT_LEFT | DT_NOPREFIX);
+                SetTextColor(hdc, prev);
+                if let Some(old) = old {
+                    SelectObject(hdc, old);
+                    let _ = DeleteObject(font.into());
+                }
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
 /// Fixed glyph/text color: black. The panel samples the taskbar pixels as its
 /// background, and the Win10 taskbar is light in both light and dark modes
 /// (dark mode tints it only slightly), so black stays readable either way.
@@ -294,6 +584,9 @@ unsafe extern "system" fn host_wndproc(
                     crate::taskbar::restore(state.panel, &state.tb, state.panel_w);
                     let _ = DestroyWindow(state.panel);
                 }
+                if !state.tip.is_invalid() {
+                    let _ = DestroyWindow(state.tip);
+                }
                 drop(state);
             }
             PostQuitMessage(0);
@@ -342,8 +635,24 @@ unsafe extern "system" fn panel_wndproc(
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        // WM_MOUSEMOVE = 0x0200: show the details tooltip on hover.
+        0x0200 => {
+            hover_tip(hwnd);
+            LRESULT(0)
+        }
+        // Hides the tooltip once the cursor leaves the panel. A timer is used
+        // instead of WM_MOUSELEAVE because the latter needs TrackMouseEvent.
+        WM_TIMER if wparam.0 == TIP_TIMER_ID => {
+            if cursor_inside(hwnd) {
+                refresh_tip(hwnd);
+            } else {
+                hide_tip(hwnd);
+            }
+            LRESULT(0)
+        }
         // WM_RBUTTONUP = 0x0205: the panel's only user interaction.
         0x0205 => {
+            hide_tip(hwnd);
             show_menu(hwnd);
             LRESULT(0)
         }
@@ -355,6 +664,7 @@ unsafe extern "system" fn panel_wndproc(
         WM_DESTROY => {
             // Clear the host's handle so it never acts on a dead window. The
             // host itself stays alive (it may be mid-rebuild).
+            hide_tip(hwnd);
             let host = host_of(hwnd);
             if !host.is_invalid() {
                 let ptr = GetWindowLongPtrW(host, GWLP_USERDATA) as *mut PanelState;
@@ -439,6 +749,7 @@ unsafe fn follow_taskbar_visibility(hwnd: HWND, tb: &Taskbar) -> bool {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         paint(hwnd);
     } else {
+        hide_tip(hwnd);
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
     show

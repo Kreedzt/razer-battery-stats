@@ -17,6 +17,10 @@ required and need not be running**.
 
 - Lives in the taskbar strip, immediately left of the notification area,
   showing a battery glyph plus a percentage (`--%` when there is no reading).
+- Hover for the model, charge level, charging state, the connection actually
+  used (wired, wireless receiver, or Bluetooth) and how fresh the reading is.
+  A bolt is drawn only when the mouse reports charging; a cable is shown as
+  `Wired` but never treated as proof of charging.
 - Polls every 30 s, every 10 s while charging, and backs off to 60 s after a
   failed read (asleep, unplugged) so it never keeps the mouse awake.
 - Keeps drawing while the Start menu or search is open, follows taskbar

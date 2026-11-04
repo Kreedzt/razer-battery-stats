@@ -80,8 +80,23 @@ Override with `RC=/path/to/rc.exe`.
   Derive the boundary from the smaller of `TrayNotifyWnd`'s left edge and
   `ReBarWindow32`'s right edge.
 - **Reading semantics.** `0%` is a valid reading; no reading renders `--%`;
-  disconnection must clear the value; charging is shown only when the device
-  explicitly reports it (absence of a bolt does not mean "not charging").
+  disconnection clears level, charging, link and model (the last-read time
+  stays for the tooltip); a failed read keeps level/link/model and clears
+  charging. Charging is shown only when the device explicitly reports it
+  (absence of a bolt does not mean "not charging"); **never** infer it from
+  `Link::Wired`.
+- **Read through every endpoint of every device.** `devices.first()` follows
+  HID enumeration order, not link preference, and `Device::battery()` hides
+  which link answered. Iterate `Device::endpoints()` (sorted Wired > Dongle >
+  Bluetooth), take the first success and record `Endpoint::link()`.
+- **The details tooltip is a top-level popup, never part of the panel face.**
+  Panel width is layout-critical. Use
+  `WS_POPUP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`, show it topmost, and place
+  it outside the strip (below a top bar, above a bottom bar); it must never
+  overlap the bar. Hide it with a 150 ms panel timer (no `TrackMouseEvent`) and
+  mirror its text into the window title for accessibility/diagnostics. The
+  tooltip may be topmost; the panel itself still must not use `WS_EX_TOPMOST`
+  or `SetWindowPos(HWND_TOPMOST)`.
 - **The context menu must not overlap the taskbar.** Explorer will not repaint
   that area, cross-process `RedrawWindow` does not fix it, and the menu leaves
   ghost pixels behind.
@@ -92,6 +107,13 @@ Override with `RC=/path/to/rc.exe`.
   visible area of the strip against the monitor rect instead.
 
 ## Pitfalls
+
+- **The task list can be narrower than `plan`'s target** when a third-party
+  band (TrafficMonitor) sits between the list and the panel. The panel rect is
+  the invariant; do not "fix" the list width.
+- **`cargo build --release` fails while the panel is running** (the exe is
+  locked). Close it with `WM_CLOSE` so it restores the layout; never
+  `Stop-Process` (that leaves the task list shrunk).
 
 - Before pixel-level verification, confirm the foreground is not
   `LockApp`/`LockScreenBackstopFrame`. While locked, every pixel check is a
@@ -132,6 +154,10 @@ Override with `RC=/path/to/rc.exe`.
 `docs/` is gitignored on purpose: it holds research, task logs and screenshots
 that are working material, not deliverables. Keeping it untracked keeps the
 published repository to code, build config and licensing.
+
+`src/panel.rs` and `src/taskbar.rs` are CRLF; `battery.rs`/`main.rs` are LF.
+Check `git diff --stat` before committing; a whole-file diff means an editor
+rewrote line endings.
 
 ## Measured baseline (Win10 19045, 3840×2160 @200%)
 

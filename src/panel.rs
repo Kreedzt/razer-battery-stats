@@ -73,6 +73,9 @@ pub struct PanelState {
     /// from, so a repaint never re-measures different text.
     tip_text: String,
     tip_snapshot: Option<crate::battery::Snapshot>,
+    /// Panel screen rect the tooltip was last anchored to; a watchdog re-embed
+    /// or tray reflow moves the panel and the tip must follow.
+    tip_panel_rect: RECT,
 }
 
 /// Label sampled at startup to size the window: a typical two-digit reading.
@@ -169,6 +172,7 @@ pub fn create(tb: &Taskbar, panel_w: i32) -> Result<HWND, String> {
             tip: HWND::default(),
             tip_text: String::new(),
             tip_snapshot: None,
+            tip_panel_rect: RECT::default(),
         });
         // The host is a hidden top-level window owned by this process only. It
         // must NOT be a child of the taskbar: it has to survive Explorer exiting.
@@ -286,12 +290,20 @@ unsafe fn hover_tip(panel: HWND) {
     }
     if !IsWindowVisible(st.tip).as_bool() {
         update_tip(panel, st);
+        // Arm once per hover. `SetTimer` with an existing id restarts the
+        // deadline, so re-arming on every mouse move would starve the 150 ms
+        // refresh/hide tick while the cursor keeps moving.
+        SetTimer(Some(panel), TIP_TIMER_ID, TIP_TIMER_MS, None);
     }
-    SetTimer(Some(panel), TIP_TIMER_ID, TIP_TIMER_MS, None);
 }
 
-/// Rebuilds the text only when the snapshot changed; the age line moves with
-/// the 30 s poll, not with every mouse pixel.
+/// Refreshes the tooltip while it is up or re-shows it after a transient hide.
+///
+/// The snapshot gate alone is not enough: a failed or missing mouse does not
+/// change the snapshot on every poll, yet "Last read N ago" must keep growing;
+/// and the panel can move under the cursor (watchdog re-embed, tray reflow), so
+/// the tip has to follow its anchor. The rendered text is compared instead of
+/// rebuilding on every 150 ms tick.
 unsafe fn refresh_tip(panel: HWND) {
     let host = host_of(panel);
     if host.is_invalid() {
@@ -306,10 +318,16 @@ unsafe fn refresh_tip(panel: HWND) {
         .as_ref()
         .map(crate::battery::BatteryMonitor::snapshot)
         .unwrap_or_default();
-    // Re-show on every tick when the window is not visible: a repaint or a
-    // transient hide must not leave the hover with no tooltip until the next
-    // poll 30 s later.
-    if !IsWindowVisible(st.tip).as_bool() || st.tip_snapshot.as_ref() != Some(&snapshot) {
+    let text = crate::battery::details_text(&snapshot, Instant::now());
+    let mut panel_rc = RECT::default();
+    let moved = GetWindowRect(panel, &mut panel_rc).is_ok() && panel_rc != st.tip_panel_rect;
+    // Re-show whenever the window is not visible: a repaint or a transient
+    // hide must not leave the hover with no tooltip until the next poll.
+    if !IsWindowVisible(st.tip).as_bool()
+        || moved
+        || st.tip_snapshot.as_ref() != Some(&snapshot)
+        || st.tip_text != text
+    {
         update_tip(panel, st);
     }
 }
@@ -393,6 +411,7 @@ unsafe fn update_tip(panel: HWND, st: &mut PanelState) {
     let _ = SetWindowTextW(st.tip, &HSTRING::from(text.as_str()));
     st.tip_text = text;
     st.tip_snapshot = Some(snapshot);
+    st.tip_panel_rect = panel_rc;
 }
 
 /// Hides the tooltip and stops the cursor poll. Safe on a dead panel.

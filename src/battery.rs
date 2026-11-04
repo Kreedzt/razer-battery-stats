@@ -421,10 +421,13 @@ mod tests {
     #[test]
     fn failed_read_keeps_level_but_drops_charging() {
         let mut snapshot = snapshot_with_reading();
+        let last_seen = snapshot.last_success;
         publish(&mut snapshot, Outcome::Failed, Instant::now());
         assert_eq!(snapshot.level, Some(47)); // last valid reading kept
         assert_eq!(snapshot.charging, None); // unknown, not "not charging"
         assert_eq!(snapshot.link, Some(Link::Dongle)); // last path kept
+        assert_eq!(snapshot.model.as_deref(), Some("Razer DeathAdder V3 Pro"));
+        assert_eq!(snapshot.last_success, last_seen); // age keeps growing from it
         assert_eq!(snapshot.availability, Availability::Stale);
     }
 
@@ -540,6 +543,20 @@ mod tests {
         assert!(text.contains("Wireless (receiver)"));
         assert!(text.contains("(stale)"));
         assert!(!text.contains("Not charging"));
+    }
+
+    #[test]
+    fn stale_age_keeps_growing_without_a_new_snapshot() {
+        // The tooltip refreshes while the snapshot is unchanged; the age line
+        // is the input that moves, so it must not be frozen at hover time.
+        let start = Instant::now();
+        let mut snapshot = snapshot_with_reading();
+        publish(&mut snapshot, Outcome::Failed, start);
+        let at_hover = details_text(&snapshot, start);
+        let later = details_text(&snapshot, start + Duration::from_secs(65));
+        assert_ne!(at_hover, later);
+        assert!(later.contains("1 min ago"), "{later}");
+        assert!(later.contains("(stale)"), "{later}");
     }
 
     #[test]
